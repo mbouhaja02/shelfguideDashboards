@@ -5,3 +5,6 @@ dist/
 .env.demo.local
 .env.*.local
 *.log
+accounts.txt
+test-results/
+playwright-report/

@@ -60,6 +60,21 @@ function asError(error: unknown, fallback: string): Error {
   return new Error(fallback);
 }
 
+function isPilotSchemaUnavailable(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { code?: string; message?: string };
+  const message = candidate.message?.toLowerCase() ?? '';
+  return (
+    candidate.code === '42P01'
+    || candidate.code === 'PGRST200'
+    || candidate.code === 'PGRST205'
+    || message.includes('schema cache')
+    || message.includes('does not exist')
+    || message.includes('could not find the table')
+    || message.includes('could not find a relationship')
+  );
+}
+
 function client(): SupabaseClient {
   if (!supabaseClient) {
     throw new Error('Configuration Supabase manquante.');
@@ -108,6 +123,7 @@ export async function loadTasks(limit = 500): Promise<ActionTask[]> {
     .order('updated_at', { ascending: false })
     .limit(limit);
 
+  if (error && isPilotSchemaUnavailable(error)) return [];
   if (error) throw asError(error, 'Chargement des taches impossible.');
   return (data ?? []).map(asTask);
 }
@@ -119,6 +135,7 @@ export async function loadStoreReferences(): Promise<StoreReference[]> {
     .eq('is_active', true)
     .order('name');
 
+  if (error && isPilotSchemaUnavailable(error)) return [];
   if (error) throw asError(error, 'Chargement des magasins impossible.');
   return (data ?? []) as StoreReference[];
 }
@@ -130,6 +147,7 @@ export async function loadShelfReferences(): Promise<ShelfReference[]> {
     .eq('is_active', true)
     .order('display_order');
 
+  if (error && isPilotSchemaUnavailable(error)) return [];
   if (error) throw asError(error, 'Chargement des rayons impossible.');
   return (data ?? []) as ShelfReference[];
 }
@@ -145,6 +163,7 @@ export async function loadTeamMembers(storeIds?: string[]): Promise<TeamMember[]
   }
 
   const { data: memberships, error: membershipError } = await membershipQuery;
+  if (membershipError && isPilotSchemaUnavailable(membershipError)) return [];
   if (membershipError) throw asError(membershipError, 'Chargement des membres impossible.');
 
   const userIds = Array.from(new Set((memberships ?? []).map((row) => String(row.user_id))));

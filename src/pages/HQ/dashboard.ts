@@ -139,19 +139,36 @@ export async function loadAnalyses(options: {
     throw new Error('Variables Supabase manquantes: ajoute VITE_SUPABASE_URL et VITE_SUPABASE_PUBLISHABLE_KEY.');
   }
 
-  let query = supabaseClient
+  let enrichedQuery = supabaseClient
     .from('shelfguide_analyses')
     .select('*, stores(name, store_format, latitude, longitude), shelves(name, category)')
     .order('audit_date', { ascending: false })
     .limit(options.limit ?? 500);
 
-  if (options.storeName) query = query.eq('store_name', options.storeName);
-  if (options.category) query = query.eq('category', options.category);
+  if (options.storeName) enrichedQuery = enrichedQuery.eq('store_name', options.storeName);
+  if (options.category) enrichedQuery = enrichedQuery.eq('category', options.category);
 
-  const { data, error } = await query;
-  if (error) throw new Error(error.message);
+  const enriched = await enrichedQuery;
+  if (!enriched.error) return (enriched.data ?? []).map(normalize);
 
-  return (data ?? []).map(normalize);
+  const relationshipUnavailable =
+    enriched.error.code === 'PGRST200'
+    || enriched.error.message.toLowerCase().includes('relationship')
+    || enriched.error.message.toLowerCase().includes('schema cache');
+  if (!relationshipUnavailable) throw new Error(enriched.error.message);
+
+  let legacyQuery = supabaseClient
+    .from('shelfguide_analyses')
+    .select('*')
+    .order('audit_date', { ascending: false })
+    .limit(options.limit ?? 500);
+
+  if (options.storeName) legacyQuery = legacyQuery.eq('store_name', options.storeName);
+  if (options.category) legacyQuery = legacyQuery.eq('category', options.category);
+
+  const legacy = await legacyQuery;
+  if (legacy.error) throw new Error(legacy.error.message);
+  return (legacy.data ?? []).map(normalize);
 }
 
 export function average(values: number[]): number {

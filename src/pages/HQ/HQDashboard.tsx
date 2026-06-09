@@ -355,6 +355,26 @@ export default function App() {
         { event: '*', schema: 'public', table: 'shelfguide_analyses' },
         () => void refresh(),
       )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'action_tasks' },
+        () => void refresh(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'task_events' },
+        () => void refresh(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'stores' },
+        () => void refresh(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'shelves' },
+        () => void refresh(),
+      )
       .subscribe();
 
     return () => {

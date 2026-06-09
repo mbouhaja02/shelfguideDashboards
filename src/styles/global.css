@@ -6566,3 +6566,33 @@ body {
     flex-direction: column;
   }
 }
+.workflow-error {
+  color: var(--danger);
+  flex-basis: 100%;
+}
+
+.manager-task-review {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.manager-task-review button {
+  min-height: 38px;
+}
+
+.manual-task-queue .activity-item {
+  grid-template-columns: auto minmax(0, 1fr) minmax(180px, 220px) auto;
+  align-items: center;
+}
+
+@media (max-width: 860px) {
+  .manual-task-queue .activity-item {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .manual-task-queue .assignment-select,
+  .manual-task-queue .manager-task-review {
+    grid-column: 1 / -1;
+  }
+}

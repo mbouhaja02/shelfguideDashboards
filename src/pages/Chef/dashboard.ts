@@ -7,6 +7,8 @@ export type GroupKey = 'store_name' | 'shelf_name' | 'category';
 
 export interface AnalysisRow {
   id: string;
+  store_id?: string;
+  shelf_id?: string;
   store_name: string;
   shelf_name: string;
   category: string;
@@ -36,6 +38,8 @@ export interface AnalysisRow {
 
 export type ShelfGuideAnalysis = {
   id?: string | number | null;
+  store_id?: string | null;
+  shelf_id?: string | null;
   store_name?: string | null;
   shelf_name?: string | null;
   category?: string | null;
@@ -62,6 +66,14 @@ export type ShelfGuideAnalysis = {
   planogram_url?: string | null;
   reference_image_url?: string | null;
   product_sku?: string | null;
+  stores?: {
+    name?: string | null;
+  } | null;
+  shelves?: {
+    name?: string | null;
+    category?: string | null;
+    planogram_url?: string | null;
+  } | null;
 };
 
 export interface DashboardGroup {
@@ -86,9 +98,11 @@ function numeric(value: unknown): number {
 function normalize(row: ShelfGuideAnalysis): AnalysisRow {
   return {
     id: String(row.id ?? crypto.randomUUID?.() ?? Math.random()),
-    store_name: row.store_name ?? 'Magasin',
-    shelf_name: row.shelf_name ?? 'Rayon',
-    category: row.category ?? 'Autre',
+    store_id: row.store_id ?? undefined,
+    shelf_id: row.shelf_id ?? undefined,
+    store_name: row.stores?.name ?? row.store_name ?? 'Magasin',
+    shelf_name: row.shelves?.name ?? row.shelf_name ?? 'Rayon',
+    category: row.shelves?.category ?? row.category ?? 'Autre',
     audit_date: row.audit_date ?? row.created_at ?? new Date().toISOString(),
     status: row.status ?? 'Moyen',
     severity: row.severity ?? 'medium',
@@ -108,7 +122,7 @@ function normalize(row: ShelfGuideAnalysis): AnalysisRow {
     money_value_available: row.money_value_available === true || row.money_value_available === 1 || row.money_value_available === '1',
     reserve_stock_status: row.reserve_stock_status?.trim() || undefined,
     warehouse_stock_status: row.warehouse_stock_status?.trim() || undefined,
-    planogram_url: row.planogram_url?.trim() || undefined,
+    planogram_url: row.shelves?.planogram_url?.trim() || row.planogram_url?.trim() || undefined,
     reference_image_url: row.reference_image_url?.trim() || undefined,
     product_sku: row.product_sku?.trim() || undefined,
   };
@@ -125,7 +139,7 @@ export async function loadAnalyses(options: {
 
   let query = supabaseClient
     .from('shelfguide_analyses')
-    .select('*')
+    .select('*, stores(name), shelves(name, category, planogram_url)')
     .order('audit_date', { ascending: false })
     .limit(options.limit ?? 500);
 
@@ -133,7 +147,7 @@ export async function loadAnalyses(options: {
   if (options.category) query = query.eq('category', options.category);
 
   const { data, error } = await query;
-  if (error) throw error;
+  if (error) throw new Error(error.message);
 
   return (data ?? []).map(normalize);
 }

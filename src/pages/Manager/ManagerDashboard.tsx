@@ -16,6 +16,18 @@ import { generateManagerReport } from './report';
 import { DashboardLayout } from '../../components/common/DashboardLayout';
 import brandLogoUrl from '../../assets/shelfguide-logo.jpeg';
 import {
+  assignTask,
+  assignTaskForAnalysis,
+  createTaskPhotoUrl,
+  loadTasks,
+  loadTeamMembers,
+  rejectTask,
+  taskPriorityFromLabel,
+  taskStatusLabel,
+  verifyTask,
+} from '../../services/tasks';
+import type { ActionTask, TaskDraft, TeamMember } from '../../types/pilot';
+import {
   getComplianceScore,
   getFillRate,
   getMainIssue,
@@ -32,6 +44,9 @@ type Theme = 'light' | 'dark';
 
 interface ShelfDecision {
   key: string;
+  analysisId: string;
+  storeId?: string;
+  shelfId?: string;
   store: string;
   shelf: string;
   category: string;
@@ -148,6 +163,9 @@ function buildShelfDecisions(rows: AnalysisRow[]): ShelfDecision[] {
 
       return {
         key,
+        analysisId: latest.id,
+        storeId: latest.store_id,
+        shelfId: latest.shelf_id,
         store: latest.store_name,
         shelf: latest.shelf_name,
         category: latest.category,
@@ -167,6 +185,29 @@ function buildShelfDecisions(rows: AnalysisRow[]): ShelfDecision[] {
       };
     })
     .sort((a, b) => b.priorityScore - a.priorityScore);
+}
+
+function taskDraftForShelf(shelf: ShelfDecision): TaskDraft {
+  if (!shelf.storeId || !shelf.shelfId) {
+    throw new Error('Ce rayon doit etre rattache au referentiel du magasin pilote.');
+  }
+
+  return {
+    analysisId: shelf.analysisId,
+    storeId: shelf.storeId,
+    shelfId: shelf.shelfId,
+    title: `${shelf.issue} - ${shelf.shelf}`,
+    description: `Action manager creee depuis le dernier audit de ${shelf.shelf}.`,
+    issueType: shelf.issue,
+    priority: taskPriorityFromLabel(shelf.priority),
+    metadata: {
+      category: shelf.category,
+      compliance: shelf.profitability,
+      empty_ratio: shelf.emptyRatio,
+      back_ratio: shelf.backRatio,
+      audit_date: shelf.lastAudit,
+    },
+  };
 }
 
 function buildTimeline(rows: AnalysisRow[], maxPoints = 7): TimelinePoint[] {
@@ -286,6 +327,8 @@ function buildQuery(range: Range, query: string, emptyTh: number, backTh: number
 
 export default function App() {
   const [rows, setRows] = useState<AnalysisRow[]>([]);
+  const [tasks, setTasks] = useState<ActionTask[]>([]);
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -301,7 +344,14 @@ export default function App() {
         category: dashboardConfig.category,
         limit: dashboardConfig.limit,
       });
+      const storeIds = Array.from(new Set(data.map((row) => row.store_id).filter((id): id is string => Boolean(id))));
+      const [taskData, memberData] = await Promise.all([
+        loadTasks(750),
+        loadTeamMembers(storeIds),
+      ]);
       setRows(data);
+      setTasks(taskData);
+      setTeamMembers(memberData);
       setLastUpdated(new Date());
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Erreur de chargement Supabase.');
@@ -329,6 +379,16 @@ export default function App() {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'shelfguide_analyses' },
+        () => void refresh(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'action_tasks' },
+        () => void refresh(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'task_events' },
         () => void refresh(),
       )
       .subscribe();
@@ -446,6 +506,13 @@ export default function App() {
       return true;
     });
   }, [shelves, query, quickWinsOnly, emptyTh, backTh]);
+  const manualTasks = useMemo(
+    () => tasks
+      .filter((task) => !task.analysis_id && task.status !== 'verified')
+      .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
+      .slice(0, 8),
+    [tasks],
+  );
 
   const qs = buildQuery(range, query, emptyTh, backTh);
   const snapshotUrl = `${window.location.origin}${window.location.pathname}${qs ? '?' + qs : ''}`;
@@ -797,10 +864,30 @@ export default function App() {
                   shelves={filteredShelves.slice(0, 12)}
                   emptyTh={emptyTh}
                   backTh={backTh}
-                  teamMembers={dashboardConfig.teamMembers}
+                  tasks={tasks}
+                  teamMembers={teamMembers}
                   onReset={resetFilters}
+                  onTaskChanged={(task) => setTasks((current) => [
+                    task,
+                    ...current.filter((item) => item.id !== task.id),
+                  ])}
                 />
               </section>
+
+              {manualTasks.length > 0 ? (
+                <section className="panel activity-panel" id="manual-tasks">
+                  <PanelTitle eyebrow="Signalements terrain" title="Anomalies creees par scanner" />
+                  <ManualTaskQueue
+                    tasks={manualTasks}
+                    shelves={shelves}
+                    teamMembers={teamMembers}
+                    onTaskChanged={(task) => setTasks((current) => [
+                      task,
+                      ...current.filter((item) => item.id !== task.id),
+                    ])}
+                  />
+                </section>
+              ) : null}
 
               <section className="panel decisions-panel">
                 <PanelTitle eyebrow="Decision" title="Synthese operationnelle" />
@@ -1225,37 +1312,72 @@ function PanelTitle({ eyebrow, title }: { eyebrow: string; title: string }) {
   );
 }
 
-function readAssignments(): Record<string, string> {
-  try {
-    const raw = window.localStorage.getItem('shelfguide-manager-assignments-v1');
-    return raw ? JSON.parse(raw) as Record<string, string> : {};
-  } catch {
-    return {};
-  }
-}
-
 function ShelfTable({
   shelves,
   emptyTh,
   backTh,
+  tasks,
   teamMembers,
   onReset,
+  onTaskChanged,
 }: {
   shelves: ShelfDecision[];
   emptyTh: number;
   backTh: number;
-  teamMembers: string[];
+  tasks: ActionTask[];
+  teamMembers: TeamMember[];
   onReset: () => void;
+  onTaskChanged: (task: ActionTask) => void;
 }) {
-  const [assignments, setAssignments] = useState<Record<string, string>>(readAssignments);
+  const [busyTask, setBusyTask] = useState<string | null>(null);
+  const [taskError, setTaskError] = useState<string | null>(null);
+  const tasksByAnalysis = useMemo(
+    () => new Map(tasks.filter((task) => task.analysis_id).map((task) => [task.analysis_id as string, task])),
+    [tasks],
+  );
 
-  useEffect(() => {
+  async function assign(shelf: ShelfDecision, assignee: string | null) {
+    const existing = tasksByAnalysis.get(shelf.analysisId);
+    if (!assignee && !existing) return;
+
+    setBusyTask(shelf.key);
+    setTaskError(null);
     try {
-      window.localStorage.setItem('shelfguide-manager-assignments-v1', JSON.stringify(assignments));
-    } catch {
-      // Assignments remain available for the current session.
+      onTaskChanged(await assignTaskForAnalysis(taskDraftForShelf(shelf), assignee));
+    } catch (error) {
+      setTaskError(error instanceof Error ? error.message : 'Assignation Supabase impossible.');
+    } finally {
+      setBusyTask(null);
     }
-  }, [assignments]);
+  }
+
+  async function review(task: ActionTask, decision: 'verify' | 'reject') {
+    setBusyTask(task.id);
+    setTaskError(null);
+    try {
+      onTaskChanged(decision === 'verify' ? await verifyTask(task.id) : await rejectTask(task.id));
+    } catch (error) {
+      setTaskError(error instanceof Error ? error.message : 'Validation Supabase impossible.');
+    } finally {
+      setBusyTask(null);
+    }
+  }
+
+  async function viewProof(task: ActionTask) {
+    const photo = task.photos[0];
+    if (!photo) return;
+
+    setBusyTask(task.id);
+    setTaskError(null);
+    try {
+      const url = await createTaskPhotoUrl(photo.storage_path);
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch (error) {
+      setTaskError(error instanceof Error ? error.message : 'Ouverture de la preuve impossible.');
+    } finally {
+      setBusyTask(null);
+    }
+  }
 
   if (shelves.length === 0) {
     return (
@@ -1281,12 +1403,21 @@ function ShelfTable({
         const priorityTone = toneFromPriority(shelf.priority);
         const fillTone = shelf.emptyRatio >= emptyTh ? 'danger' : shelf.emptyRatio >= emptyTh * 0.7 ? 'warning' : 'success';
         const backTone = shelf.backRatio >= backTh ? 'warning' : 'success';
+        const task = tasksByAnalysis.get(shelf.analysisId);
+        const availableMembers = teamMembers.filter(
+          (member) =>
+            member.storeId === shelf.storeId
+            && (
+              member.role === 'manager'
+              || (shelf.shelfId ? member.shelfIds.includes(shelf.shelfId) : false)
+            ),
+        );
         const quickWin =
           shelf.issue === 'Mauvaise orientation' &&
           shelf.emptyRatio < emptyTh &&
           shelf.backRatio >= Math.max(3, backTh * 0.6);
         return (
-          <article className={`risk-shelf-card row-${priorityTone}`} key={shelf.key}>
+          <article className={`risk-shelf-card row-${priorityTone}`} key={shelf.key} data-analysis-id={shelf.analysisId}>
             <div className="card-topline">
               <div>
                 <StatusBadge tone={priorityTone} label={shelf.priority} />
@@ -1313,22 +1444,138 @@ function ShelfTable({
             <div className="card-action-row">
               <div>
                 <span>{pct(shelf.emptyRatio)} vide - {pct(shelf.backRatio)} back-side</span>
-                <small>Assignation locale, connecteur planning a brancher</small>
+                <small>{task ? `${taskStatusLabel(task.status)} - synchronise Supabase` : 'Aucune tache assignee'}</small>
+                {task?.photos.length ? <small>{task.photos.length} photo(s) de preuve</small> : null}
               </div>
               <label className="assignment-select">
                 <span>Responsable</span>
                 <select
-                  value={assignments[shelf.key] ?? ''}
-                  onChange={(event) => setAssignments((current) => ({ ...current, [shelf.key]: event.target.value }))}
+                  value={task?.assigned_to ?? ''}
+                  disabled={busyTask === shelf.key || busyTask === task?.id}
+                  onChange={(event) => void assign(shelf, event.target.value || null)}
                 >
                   <option value="">Assigner a...</option>
-                  {teamMembers.map((member) => <option value={member} key={member}>{member}</option>)}
+                  {availableMembers.map((member) => (
+                    <option value={member.userId} key={member.userId}>
+                      {member.fullName} - {member.role}
+                    </option>
+                  ))}
                 </select>
               </label>
+              {task?.status === 'corrected' ? (
+                <div className="manager-task-review">
+                  {task.photos.length > 0 ? (
+                    <button className="workflow-secondary" type="button" disabled={busyTask === task.id} onClick={() => void viewProof(task)}>
+                      Voir preuve
+                    </button>
+                  ) : null}
+                  <button type="button" disabled={busyTask === task.id} onClick={() => void review(task, 'verify')}>
+                    Valider
+                  </button>
+                  <button className="workflow-secondary" type="button" disabled={busyTask === task.id} onClick={() => void review(task, 'reject')}>
+                    A reprendre
+                  </button>
+                </div>
+              ) : null}
             </div>
           </article>
         );
       })}
+      {taskError ? <p className="notice danger">{taskError}</p> : null}
+    </div>
+  );
+}
+
+function ManualTaskQueue({
+  tasks,
+  shelves,
+  teamMembers,
+  onTaskChanged,
+}: {
+  tasks: ActionTask[];
+  shelves: ShelfDecision[];
+  teamMembers: TeamMember[];
+  onTaskChanged: (task: ActionTask) => void;
+}) {
+  const [busyTask, setBusyTask] = useState<string | null>(null);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const shelfById = useMemo(
+    () => new Map(shelves.filter((shelf) => shelf.shelfId).map((shelf) => [shelf.shelfId as string, shelf])),
+    [shelves],
+  );
+
+  async function run(taskId: string, operation: () => Promise<ActionTask>) {
+    setBusyTask(taskId);
+    setQueueError(null);
+    try {
+      onTaskChanged(await operation());
+    } catch (error) {
+      setQueueError(error instanceof Error ? error.message : 'Action sur le signalement impossible.');
+    } finally {
+      setBusyTask(null);
+    }
+  }
+
+  async function viewProof(task: ActionTask) {
+    const photo = task.photos[0];
+    if (!photo) return;
+    await run(task.id, async () => {
+      const url = await createTaskPhotoUrl(photo.storage_path);
+      window.open(url, '_blank', 'noopener,noreferrer');
+      return task;
+    });
+  }
+
+  return (
+    <div className="activity-feed manual-task-queue">
+      {tasks.map((task) => {
+        const shelf = shelfById.get(task.shelf_id);
+        const members = teamMembers.filter(
+          (member) =>
+            member.storeId === task.store_id
+            && (member.role === 'manager' || member.shelfIds.includes(task.shelf_id)),
+        );
+        return (
+          <article className="activity-item" key={task.id}>
+            <span className={`activity-avatar ${task.priority === 'high' ? 'danger' : 'warning'}`}>SC</span>
+            <div>
+              <strong>{task.title}</strong>
+              <small>{shelf?.shelf ?? 'Rayon reference'} - {taskStatusLabel(task.status)}</small>
+              {task.product_sku ? <small>Produit: {task.product_sku}</small> : null}
+            </div>
+            <label className="assignment-select">
+              <span>Responsable</span>
+              <select
+                value={task.assigned_to ?? ''}
+                disabled={busyTask === task.id}
+                onChange={(event) => void run(
+                  task.id,
+                  () => assignTask(task.id, event.target.value || null),
+                )}
+              >
+                <option value="">Assigner a...</option>
+                {members.map((member) => (
+                  <option key={member.userId} value={member.userId}>
+                    {member.fullName} - {member.role}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {task.status === 'corrected' ? (
+              <div className="manager-task-review">
+                {task.photos.length > 0 ? (
+                  <button className="workflow-secondary" type="button" onClick={() => void viewProof(task)}>
+                    Voir preuve
+                  </button>
+                ) : null}
+                <button type="button" onClick={() => void run(task.id, () => verifyTask(task.id))}>Valider</button>
+                <button className="workflow-secondary" type="button" onClick={() => void run(task.id, () => rejectTask(task.id))}>A reprendre</button>
+              </div>
+            ) : null}
+          </article>
+        );
+      })}
+      {queueError ? <p className="notice danger">{queueError}</p> : null}
     </div>
   );
 }

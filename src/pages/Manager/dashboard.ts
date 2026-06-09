@@ -7,6 +7,8 @@ export type GroupKey = 'store_name' | 'shelf_name' | 'category';
 
 export interface AnalysisRow {
   id: string;
+  store_id?: string;
+  shelf_id?: string;
   store_name: string;
   shelf_name: string;
   category: string;
@@ -31,6 +33,8 @@ export interface AnalysisRow {
 
 export type ShelfGuideAnalysis = {
   id?: string | number | null;
+  store_id?: string | null;
+  shelf_id?: string | null;
   store_name?: string | null;
   shelf_name?: string | null;
   category?: string | null;
@@ -52,6 +56,13 @@ export type ShelfGuideAnalysis = {
   shelf_loss_percent?: number | string | null;
   shelf_profitability_percent?: number | string | null;
   money_value_available?: boolean | number | string | null;
+  stores?: {
+    name?: string | null;
+  } | null;
+  shelves?: {
+    name?: string | null;
+    category?: string | null;
+  } | null;
 };
 
 export interface DashboardGroup {
@@ -76,9 +87,11 @@ function numeric(value: unknown): number {
 function normalize(row: ShelfGuideAnalysis): AnalysisRow {
   return {
     id: String(row.id ?? crypto.randomUUID?.() ?? Math.random()),
-    store_name: row.store_name ?? 'Magasin',
-    shelf_name: row.shelf_name ?? 'Rayon',
-    category: row.category ?? 'Autre',
+    store_id: row.store_id ?? undefined,
+    shelf_id: row.shelf_id ?? undefined,
+    store_name: row.stores?.name ?? row.store_name ?? 'Magasin',
+    shelf_name: row.shelves?.name ?? row.shelf_name ?? 'Rayon',
+    category: row.shelves?.category ?? row.category ?? 'Autre',
     audit_date: row.audit_date ?? row.created_at ?? new Date().toISOString(),
     status: row.status ?? 'Moyen',
     severity: row.severity ?? 'medium',
@@ -110,7 +123,7 @@ export async function loadAnalyses(options: {
 
   let query = supabaseClient
     .from('shelfguide_analyses')
-    .select('*')
+    .select('*, stores(name), shelves(name, category)')
     .order('audit_date', { ascending: false })
     .limit(options.limit ?? 500);
 
@@ -118,7 +131,7 @@ export async function loadAnalyses(options: {
   if (options.category) query = query.eq('category', options.category);
 
   const { data, error } = await query;
-  if (error) throw error;
+  if (error) throw new Error(error.message);
 
   return (data ?? []).map(normalize);
 }

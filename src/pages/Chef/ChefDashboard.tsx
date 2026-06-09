@@ -16,6 +16,16 @@ import { generateChefReport } from './report';
 import { DashboardLayout } from '../../components/common/DashboardLayout';
 import brandLogoUrl from '../../assets/shelfguide-logo.jpeg';
 import {
+  claimTask,
+  correctTask,
+  createManualTask,
+  loadTasks,
+  reopenTask,
+  taskPriorityFromLabel,
+  taskStatusLabel,
+} from '../../services/tasks';
+import type { ActionTask, TaskDraft } from '../../types/pilot';
+import {
   getComplianceScore,
   getFillRate,
   getMainIssue,
@@ -30,10 +40,11 @@ type Tone = 'danger' | 'warning' | 'success' | 'primary';
 type Priority = 'Haute' | 'Moyenne' | 'Faible';
 type Theme = 'light' | 'dark';
 type StockState = 'reserve' | 'warehouse_out' | 'unknown';
-type ResolutionState = 'todo' | 'active' | 'corrected';
 
 interface ActionRow {
   id: string;
+  storeId?: string;
+  shelfId?: string;
   store: string;
   shelf: string;
   category: string;
@@ -168,6 +179,8 @@ function buildActions(rows: AnalysisRow[]): ActionRow[] {
 
       return {
         id: row.id,
+        storeId: row.store_id,
+        shelfId: row.shelf_id,
         store: row.store_name,
         shelf: row.shelf_name,
         category: row.category,
@@ -192,6 +205,30 @@ function buildActions(rows: AnalysisRow[]): ActionRow[] {
       };
     })
     .sort((a, b) => b.score - a.score);
+}
+
+function taskDraftForAction(action: ActionRow): TaskDraft {
+  if (!action.storeId || !action.shelfId) {
+    throw new Error('Cette analyse doit etre rattachee au magasin pilote et a un rayon.');
+  }
+
+  return {
+    analysisId: action.id,
+    storeId: action.storeId,
+    shelfId: action.shelfId,
+    title: `${action.issue} - ${action.shelf}`,
+    description: action.recommendation,
+    issueType: action.issue,
+    productSku: action.productSku,
+    priority: taskPriorityFromLabel(action.priority),
+    metadata: {
+      category: action.category,
+      compliance: action.compliance,
+      empty_ratio: action.emptyRatio,
+      back_ratio: action.backRatio,
+      audit_date: action.lastAudit,
+    },
+  };
 }
 
 function buildCategories(rows: AnalysisRow[]): CategoryFocus[] {
@@ -301,6 +338,7 @@ function buildQuery(range: Range, query: string, emptyTh: number, backTh: number
 
 export default function App() {
   const [rows, setRows] = useState<AnalysisRow[]>([]);
+  const [tasks, setTasks] = useState<ActionTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -311,12 +349,16 @@ export default function App() {
       if (showLoading) setLoading(true);
       else setRefreshing(true);
       setError(null);
-      const data = await loadAnalyses({
-        storeName: dashboardConfig.storeName,
-        category: dashboardConfig.category,
-        limit: dashboardConfig.limit,
-      });
+      const [data, taskData] = await Promise.all([
+        loadAnalyses({
+          storeName: dashboardConfig.storeName,
+          category: dashboardConfig.category,
+          limit: dashboardConfig.limit,
+        }),
+        loadTasks(500),
+      ]);
       setRows(data);
+      setTasks(taskData);
       setLastUpdated(new Date());
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Erreur de chargement Supabase.');
@@ -344,6 +386,16 @@ export default function App() {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'shelfguide_analyses' },
+        () => void refresh(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'action_tasks' },
+        () => void refresh(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'task_events' },
         () => void refresh(),
       )
       .subscribe();
@@ -700,7 +752,17 @@ export default function App() {
                     onChange={(event) => setQuery(event.target.value)}
                   />
                 </div>
-                <ActionTable actions={filteredActions.slice(0, 12)} emptyTh={emptyTh} backTh={backTh} onReset={resetFilters} />
+                <ActionTable
+                  actions={filteredActions.slice(0, 12)}
+                  tasks={tasks}
+                  emptyTh={emptyTh}
+                  backTh={backTh}
+                  onReset={resetFilters}
+                  onTaskChanged={(task) => setTasks((current) => [
+                    task,
+                    ...current.filter((item) => item.id !== task.id),
+                  ])}
+                />
               </section>
 
               <section className="panel action-center-panel">
@@ -755,7 +817,13 @@ export default function App() {
           </>
         ) : null}
       </DashboardLayout>
-      <ScannerQuickAction />
+      <ScannerQuickAction
+        actions={actions}
+        onTaskCreated={(task) => setTasks((current) => [
+          task,
+          ...current.filter((item) => item.id !== task.id),
+        ])}
+      />
     </>
   );
 }
@@ -1115,25 +1183,25 @@ function RatioCell({ value, tone }: { value: number; tone: Tone }) {
   );
 }
 
-function readResolutionStates(): Record<string, ResolutionState> {
-  try {
-    const raw = window.localStorage.getItem('shelfguide-chef-resolution-v1');
-    return raw ? JSON.parse(raw) as Record<string, ResolutionState> : {};
-  } catch {
-    return {};
-  }
-}
-
-function ActionTable({ actions, emptyTh, backTh, onReset }: { actions: ActionRow[]; emptyTh: number; backTh: number; onReset: () => void }) {
-  const [resolutionStates, setResolutionStates] = useState<Record<string, ResolutionState>>(readResolutionStates);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem('shelfguide-chef-resolution-v1', JSON.stringify(resolutionStates));
-    } catch {
-      // Local workflow still works when persistent storage is unavailable.
-    }
-  }, [resolutionStates]);
+function ActionTable({
+  actions,
+  tasks,
+  emptyTh,
+  backTh,
+  onReset,
+  onTaskChanged,
+}: {
+  actions: ActionRow[];
+  tasks: ActionTask[];
+  emptyTh: number;
+  backTh: number;
+  onReset: () => void;
+  onTaskChanged: (task: ActionTask) => void;
+}) {
+  const tasksByAnalysis = useMemo(
+    () => new Map(tasks.filter((task) => task.analysis_id).map((task) => [task.analysis_id as string, task])),
+    [tasks],
+  );
 
   if (actions.length === 0) {
     return (
@@ -1158,7 +1226,7 @@ function ActionTable({ actions, emptyTh, backTh, onReset }: { actions: ActionRow
       {actions.map((action) => {
         const priorityTone = toneFromPriority(action.priority);
         return (
-          <article className={`task-action-card row-${priorityTone}`} key={action.id}>
+          <article className={`task-action-card row-${priorityTone}`} key={action.id} data-analysis-id={action.id}>
             <div className="task-top">
               <div>
                 <StatusBadge tone={priorityTone} label={action.priority} />
@@ -1187,8 +1255,9 @@ function ActionTable({ actions, emptyTh, backTh, onReset }: { actions: ActionRow
             <div className="task-recommendation">
               <p>{action.recommendation}</p>
               <ResolutionWorkflow
-                state={resolutionStates[action.id] ?? 'todo'}
-                onStateChange={(state) => setResolutionStates((current) => ({ ...current, [action.id]: state }))}
+                action={action}
+                task={tasksByAnalysis.get(action.id)}
+                onTaskChanged={onTaskChanged}
               />
             </div>
           </article>
@@ -1222,48 +1291,90 @@ function PlanogramPreview({ action }: { action: ActionRow }) {
 }
 
 function ResolutionWorkflow({
-  state,
-  onStateChange,
+  action,
+  task,
+  onTaskChanged,
 }: {
-  state: ResolutionState;
-  onStateChange: (state: ResolutionState) => void;
+  action: ActionRow;
+  task?: ActionTask;
+  onTaskChanged: (task: ActionTask) => void;
 }) {
   const proofInput = useRef<HTMLInputElement>(null);
-  const [proofName, setProofName] = useState('');
+  const [proof, setProof] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [workflowError, setWorkflowError] = useState<string | null>(null);
+  const state = !task || task.status === 'open'
+    ? 'todo'
+    : task.status === 'corrected' || task.status === 'verified'
+      ? 'corrected'
+      : 'active';
+
+  async function run(operation: () => Promise<ActionTask>) {
+    setBusy(true);
+    setWorkflowError(null);
+    try {
+      onTaskChanged(await operation());
+    } catch (error) {
+      setWorkflowError(error instanceof Error ? error.message : 'Action Supabase impossible.');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   if (state === 'todo') {
     return (
       <div className="resolution-workflow">
-        <button type="button" onClick={() => onStateChange('active')}>Pris en charge</button>
-        <small>Suivi local, synchronisation manager a connecter</small>
+        <button type="button" disabled={busy} onClick={() => void run(() => claimTask(taskDraftForAction(action)))}>
+          {busy ? 'Synchronisation...' : 'Pris en charge'}
+        </button>
+        <small>Suivi Supabase partage avec le manager</small>
+        {workflowError ? <small className="workflow-error">{workflowError}</small> : null}
       </div>
     );
   }
 
+  if (!task) return null;
+
   if (state === 'corrected') {
     return (
       <div className="resolution-workflow corrected">
-        <span>Corrige{proofName ? ` - preuve: ${proofName}` : ''}</span>
-        <button className="workflow-secondary" type="button" onClick={() => onStateChange('active')}>Rouvrir</button>
+        <span>
+          {taskStatusLabel(task.status)}
+          {task.photos.length > 0 ? ` - ${task.photos.length} preuve(s)` : ''}
+        </span>
+        {task.status !== 'verified' ? (
+          <button
+            className="workflow-secondary"
+            type="button"
+            disabled={busy}
+            onClick={() => void run(() => reopenTask(task.id))}
+          >
+            Rouvrir
+          </button>
+        ) : null}
+        {workflowError ? <small className="workflow-error">{workflowError}</small> : null}
       </div>
     );
   }
 
   return (
     <div className="resolution-workflow active">
-      <span>Pris en charge</span>
+      <span>{task.status === 'rejected' ? 'A reprendre' : 'Pris en charge'}</span>
       <input
         ref={proofInput}
         className="visually-hidden"
         type="file"
         accept="image/*"
         capture="environment"
-        onChange={(event) => setProofName(event.target.files?.[0]?.name ?? '')}
+        onChange={(event) => setProof(event.target.files?.[0] ?? null)}
       />
-      <button className="workflow-secondary" type="button" onClick={() => proofInput.current?.click()}>
-        {proofName ? 'Photo ajoutee' : 'Ajouter photo'}
+      <button className="workflow-secondary" type="button" disabled={busy} onClick={() => proofInput.current?.click()}>
+        {proof ? 'Photo prete' : 'Ajouter photo'}
       </button>
-      <button type="button" onClick={() => onStateChange('corrected')}>Corrige</button>
+      <button type="button" disabled={busy} onClick={() => void run(() => correctTask(task, proof ?? undefined))}>
+        {busy ? 'Envoi...' : 'Corrige'}
+      </button>
+      {workflowError ? <small className="workflow-error">{workflowError}</small> : null}
     </div>
   );
 }
@@ -1272,13 +1383,36 @@ type BarcodeDetectorConstructor = new (options?: { formats?: string[] }) => {
   detect(source: ImageBitmap): Promise<Array<{ rawValue?: string }>>;
 };
 
-function ScannerQuickAction() {
+function ScannerQuickAction({
+  actions,
+  onTaskCreated,
+}: {
+  actions: ActionRow[];
+  onTaskCreated: (task: ActionTask) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [code, setCode] = useState('');
   const [issue, setIssue] = useState<MainIssue>('Rupture visible');
   const [scanStatus, setScanStatus] = useState('Pret a scanner une etiquette');
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [selectedShelf, setSelectedShelf] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
+  const shelfOptions = useMemo(() => {
+    const unique = new Map<string, ActionRow>();
+    for (const action of actions) {
+      if (action.storeId && action.shelfId && !unique.has(action.shelfId)) {
+        unique.set(action.shelfId, action);
+      }
+    }
+    return Array.from(unique.values()).sort((a, b) => a.shelf.localeCompare(b.shelf));
+  }, [actions]);
+
+  useEffect(() => {
+    if (!selectedShelf && shelfOptions[0]) {
+      setSelectedShelf(shelfOptions[0].shelfId ?? '');
+    }
+  }, [selectedShelf, shelfOptions]);
 
   async function inspectPhoto(file?: File) {
     if (!file) return;
@@ -1302,21 +1436,39 @@ function ScannerQuickAction() {
     }
   }
 
-  function saveDraft() {
+  async function saveDraft() {
     if (!code.trim()) {
       setScanStatus('Saisissez ou scannez une reference produit.');
       return;
     }
-    try {
-      const raw = window.localStorage.getItem('shelfguide-chef-manual-issues-v1');
-      const current = raw ? JSON.parse(raw) as unknown[] : [];
-      current.unshift({ code: code.trim(), issue, createdAt: new Date().toISOString() });
-      window.localStorage.setItem('shelfguide-chef-manual-issues-v1', JSON.stringify(current.slice(0, 50)));
-    } catch {
-      // The confirmation remains visible even in restricted storage contexts.
+    const shelf = shelfOptions.find((item) => item.shelfId === selectedShelf);
+    if (!shelf?.storeId || !shelf.shelfId) {
+      setScanStatus('Selectionnez un rayon autorise.');
+      return;
     }
-    setSaved(true);
-    setScanStatus('Anomalie enregistree comme brouillon local.');
+
+    setSaving(true);
+    setSaved(false);
+    setScanStatus('Creation de la tache...');
+    try {
+      const task = await createManualTask({
+        storeId: shelf.storeId,
+        shelfId: shelf.shelfId,
+        title: `${issue} - ${shelf.shelf}`,
+        description: `Anomalie declaree manuellement pour le produit ${code.trim()}.`,
+        issueType: issue,
+        productSku: code.trim(),
+        priority: issue === 'Rupture visible' ? 'high' : 'medium',
+        metadata: { category: shelf.category },
+      });
+      onTaskCreated(task);
+      setSaved(true);
+      setScanStatus('Anomalie synchronisee avec le manager.');
+    } catch (error) {
+      setScanStatus(error instanceof Error ? error.message : 'Creation de la tache impossible.');
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -1348,6 +1500,15 @@ function ScannerQuickAction() {
             />
             <button className="scanner-capture" type="button" onClick={() => fileInput.current?.click()}>Ouvrir la camera</button>
             <label>
+              <span>Rayon concerne</span>
+              <select value={selectedShelf} onChange={(event) => setSelectedShelf(event.target.value)}>
+                {shelfOptions.length === 0 ? <option value="">Aucun rayon autorise</option> : null}
+                {shelfOptions.map((action) => (
+                  <option key={action.shelfId} value={action.shelfId}>{action.shelf}</option>
+                ))}
+              </select>
+            </label>
+            <label>
               <span>Code produit</span>
               <input value={code} onChange={(event) => setCode(event.target.value)} placeholder="EAN ou reference rayon" />
             </label>
@@ -1360,10 +1521,15 @@ function ScannerQuickAction() {
                 <option value="Audit incomplet">Audit incomplet</option>
               </select>
             </label>
-            <button className="scanner-submit" type="button" onClick={saveDraft}>
-              {saved ? 'Brouillon enregistre' : 'Declarer anomalie'}
+            <button
+              className="scanner-submit"
+              type="button"
+              disabled={saving || shelfOptions.length === 0}
+              onClick={() => void saveDraft()}
+            >
+              {saving ? 'Synchronisation...' : saved ? 'Anomalie enregistree' : 'Declarer anomalie'}
             </button>
-            <small>Le brouillon reste local jusqu'a la connexion d'une table d'anomalies Supabase.</small>
+            <small>La tache est partagee en temps reel avec le manager du magasin.</small>
           </aside>
         </div>
       ) : null}

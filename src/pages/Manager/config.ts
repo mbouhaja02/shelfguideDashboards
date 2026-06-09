@@ -20,8 +20,4 @@ export const dashboardConfig = {
   minPerManualAudit: 12, // minutes economisees par audit automatise vs manuel
   networkLabel: 'Reseau Franprix - Maroc',
   peakHour: import.meta.env.VITE_PEAK_HOUR?.trim() || '17:30',
-  teamMembers: (() => {
-    const configured = import.meta.env.VITE_TEAM_MEMBERS?.split(',').map((name: string) => name.trim()).filter(Boolean) ?? [];
-    return configured.length > 0 ? configured.slice(0, 8) : ['Equipe A', 'Equipe B'];
-  })(),
 };
